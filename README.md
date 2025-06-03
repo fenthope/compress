@@ -13,7 +13,7 @@ go get github.com/fenthope/compress
 ```go
 func main() {
 	// 1. 创建 Touka 路由Engine
-	r := touka.New()
+	r := touka.Default()
 
 	r.Use(compress.Compression(compress.CompressOptions{
 		// Algorithms: 配置每种压缩算法的级别和是否启用对象池
