@@ -453,6 +453,10 @@ func (crw *compressResponseWriter) Written() bool { return crw.ResponseWriter.Wr
 // Compression 返回一个通用的压缩中间件，支持 Gzip, Deflate, Zstd。
 // 它会根据客户端的 Accept-Encoding 头部和服务器配置选择最佳的压缩算法。
 func Compression(opts CompressOptions) touka.HandlerFunc {
+	if opts.Algorithms == nil && len(opts.CompressibleTypes) == 0 && len(opts.EncodingPriority) == 0 && opts.MinContentLength == 0 {
+		opts = DefaultCompressionConfig()
+	}
+
 	// 设置默认算法配置 (如果用户没有提供)
 	if opts.Algorithms == nil {
 		opts.Algorithms = make(map[string]AlgorithmConfig)
@@ -515,6 +519,19 @@ func Compression(opts CompressOptions) touka.HandlerFunc {
 		// c.Next() 返回后，如果 crw.doCompression 仍然为 true，
 		// 且 crw.compressor 已创建，则响应已被写入压缩器。
 		// defer 中的 releaseCompressResponseWriter 会负责关闭压缩器并刷新剩余数据。
+	}
+}
+
+// DefaultCompressionConfig 获取默认配置
+func DefaultCompressionConfig() CompressOptions {
+	return CompressOptions{
+		Algorithms: map[string]AlgorithmConfig{
+			encodingGzip:    {Level: gzip.DefaultCompression, PoolEnabled: true},
+			encodingDeflate: {Level: flate.DefaultCompression, PoolEnabled: true},
+		},
+		MinContentLength:  0,
+		CompressibleTypes: defaultCompressibleTypes,
+		EncodingPriority:  []string{encodingGzip, encodingDeflate},
 	}
 }
 
