@@ -2,8 +2,7 @@ package compress
 
 import (
 	"bufio"
-	"compress/flate" // Deflate
-	"compress/gzip"  // Gzip
+	"compress/gzip" // Gzip
 	"errors"
 	"io"
 	"net"
@@ -12,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/klauspost/compress/flate" // Deflate
 
 	"github.com/infinite-iroha/touka"
 	"github.com/klauspost/compress/zstd" // Zstandard
