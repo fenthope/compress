@@ -29,14 +29,14 @@ const (
 
 // 支持的压缩编码名称
 const (
-	encodingGzip     = "gzip"
-	encodingDeflate  = "deflate"
-	encodingZstd     = "zstd"
-	encodingIdentity = "identity" // 表示不压缩
+	EncodingGzip     = "gzip"
+	EncodingDeflate  = "deflate"
+	EncodingZstd     = "zstd"
+	EncodingIdentity = "identity" // 表示不压缩
 )
 
-// defaultCompressibleTypes 默认可压缩的 MIME 类型列表
-var defaultCompressibleTypes = []string{
+// DefaultCompressibleTypes 默认可压缩的 MIME 类型列表
+var DefaultCompressibleTypes = []string{
 	"text/html", "text/css", "text/plain", "text/javascript",
 	"application/javascript", "application/x-javascript", "application/json",
 	"application/xml", "image/svg+xml",
@@ -190,7 +190,7 @@ func init() {
 // getCompressor 从池中获取或创建一个新的压缩器
 func getCompressor(encoding string, level int, underlyingWriter io.Writer, poolEnabled bool) compressWriter {
 	switch encoding {
-	case encodingGzip:
+	case EncodingGzip:
 		idx := level - gzip.BestSpeed
 		if level == gzip.DefaultCompression {
 			idx = gzip.BestCompression - gzip.BestSpeed + 1
@@ -206,7 +206,7 @@ func getCompressor(encoding string, level int, underlyingWriter io.Writer, poolE
 		// 如果池未启用或级别超出预设池范围，则创建新的
 		w, _ := gzip.NewWriterLevel(underlyingWriter, level)
 		return &gzipCompressWriter{Writer: w, level: level}
-	case encodingDeflate:
+	case EncodingDeflate:
 		idx := level - flate.BestSpeed
 		if level == flate.DefaultCompression {
 			idx = flate.BestCompression - flate.BestSpeed + 1
@@ -218,7 +218,7 @@ func getCompressor(encoding string, level int, underlyingWriter io.Writer, poolE
 		}
 		w, _ := flate.NewWriter(underlyingWriter, level)
 		return &deflateCompressWriter{Writer: w, level: level}
-	case encodingZstd:
+	case EncodingZstd:
 		// 简化：仅当级别为 SpeedDefault 且池启用时才使用池
 		// 生产代码中可以为特定需要的 zstd 级别创建更多池
 		zstdLevel := zstd.EncoderLevelFromZstd(level) // 将 int 转换为 zstd.EncoderLevel
@@ -239,7 +239,7 @@ func putCompressor(cw compressWriter, encoding string, poolEnabled bool) {
 		return
 	}
 	switch encoding {
-	case encodingGzip:
+	case EncodingGzip:
 		if gzw, ok := cw.(*gzipCompressWriter); ok {
 			idx := gzw.level - gzip.BestSpeed
 			if gzw.level == gzip.DefaultCompression {
@@ -252,7 +252,7 @@ func putCompressor(cw compressWriter, encoding string, poolEnabled bool) {
 				gzipWriterPoolsArray[idx].Put(gzw)
 			}
 		}
-	case encodingDeflate:
+	case EncodingDeflate:
 		if fw, ok := cw.(*deflateCompressWriter); ok {
 			idx := fw.level - flate.BestSpeed
 			if fw.level == flate.DefaultCompression {
@@ -262,7 +262,7 @@ func putCompressor(cw compressWriter, encoding string, poolEnabled bool) {
 				deflateWriterPoolsArray[idx].Put(fw)
 			}
 		}
-	case encodingZstd:
+	case EncodingZstd:
 		if zw, ok := cw.(*zstdCompressWriter); ok {
 			if zw.level == zstd.SpeedDefault && zstdWriterPoolDefault != nil { // 仅返还默认级别的到池
 				zstdWriterPoolDefault.Put(zw)
@@ -338,7 +338,7 @@ func (crw *compressResponseWriter) WriteHeader(statusCode int) {
 	contentType := strings.ToLower(strings.TrimSpace(strings.Split(crw.Header().Get(headerContentType), ";")[0]))
 	compressibleTypes := crw.options.CompressibleTypes
 	if len(compressibleTypes) == 0 {
-		compressibleTypes = defaultCompressibleTypes
+		compressibleTypes = DefaultCompressibleTypes
 	}
 	isCompressible := false
 	for _, t := range compressibleTypes {
@@ -365,7 +365,7 @@ func (crw *compressResponseWriter) WriteHeader(statusCode int) {
 	}
 
 	// 如果到这里，doCompression 仍然为 true，并且 chosenEncoding 应该已经被设置
-	if !crw.doCompression || crw.chosenEncoding == "" || crw.chosenEncoding == encodingIdentity {
+	if !crw.doCompression || crw.chosenEncoding == "" || crw.chosenEncoding == EncodingIdentity {
 		crw.doCompression = false // 双重检查或处理 identity 的情况
 		crw.ResponseWriter.WriteHeader(statusCode)
 		return
@@ -379,11 +379,11 @@ func (crw *compressResponseWriter) WriteHeader(statusCode int) {
 	algoConfig, ok := crw.options.Algorithms[crw.chosenEncoding]
 	if !ok { // 如果 chosenEncoding 不在配置中，使用默认级别
 		switch crw.chosenEncoding {
-		case encodingGzip:
+		case EncodingGzip:
 			algoConfig = AlgorithmConfig{Level: gzip.DefaultCompression, PoolEnabled: true}
-		case encodingDeflate:
+		case EncodingDeflate:
 			algoConfig = AlgorithmConfig{Level: flate.DefaultCompression, PoolEnabled: true}
-		case encodingZstd:
+		case EncodingZstd:
 			algoConfig = AlgorithmConfig{Level: int(zstd.SpeedDefault), PoolEnabled: true} // zstd.SpeedDefault是3
 		default: // 不应该发生
 			crw.doCompression = false
@@ -462,26 +462,26 @@ func Compression(opts CompressOptions) touka.HandlerFunc {
 	if opts.Algorithms == nil {
 		opts.Algorithms = make(map[string]AlgorithmConfig)
 	}
-	if _, ok := opts.Algorithms[encodingGzip]; !ok {
-		opts.Algorithms[encodingGzip] = AlgorithmConfig{Level: gzip.DefaultCompression, PoolEnabled: true}
+	if _, ok := opts.Algorithms[EncodingGzip]; !ok {
+		opts.Algorithms[EncodingGzip] = AlgorithmConfig{Level: gzip.DefaultCompression, PoolEnabled: true}
 	}
-	if _, ok := opts.Algorithms[encodingDeflate]; !ok {
-		opts.Algorithms[encodingDeflate] = AlgorithmConfig{Level: flate.DefaultCompression, PoolEnabled: true}
+	if _, ok := opts.Algorithms[EncodingDeflate]; !ok {
+		opts.Algorithms[EncodingDeflate] = AlgorithmConfig{Level: flate.DefaultCompression, PoolEnabled: true}
 	}
 	// Zstd 默认不启用，除非用户在 opts.Algorithms 中明确配置
-	// 例如：opts.Algorithms[encodingZstd] = AlgorithmConfig{Level: int(zstd.SpeedDefault), PoolEnabled: true}
+	// 例如：opts.Algorithms[EncodingZstd] = AlgorithmConfig{Level: int(zstd.SpeedDefault), PoolEnabled: true}
 
 	// 设置默认编码优先级
 	if len(opts.EncodingPriority) == 0 {
 		defaultPrio := []string{}
-		if _, ok := opts.Algorithms[encodingZstd]; ok {
-			defaultPrio = append(defaultPrio, encodingZstd)
+		if _, ok := opts.Algorithms[EncodingZstd]; ok {
+			defaultPrio = append(defaultPrio, EncodingZstd)
 		}
-		if _, ok := opts.Algorithms[encodingGzip]; ok {
-			defaultPrio = append(defaultPrio, encodingGzip)
+		if _, ok := opts.Algorithms[EncodingGzip]; ok {
+			defaultPrio = append(defaultPrio, EncodingGzip)
 		}
-		if _, ok := opts.Algorithms[encodingDeflate]; ok {
-			defaultPrio = append(defaultPrio, encodingDeflate)
+		if _, ok := opts.Algorithms[EncodingDeflate]; ok {
+			defaultPrio = append(defaultPrio, EncodingDeflate)
 		}
 		opts.EncodingPriority = defaultPrio
 	}
@@ -494,7 +494,7 @@ func Compression(opts CompressOptions) touka.HandlerFunc {
 		chosenEncoding := negotiateEncoding(clientAcceptedEncodings, opts.Algorithms, opts.EncodingPriority)
 
 		// 如果选择不压缩 (identity) 或者没有可用的压缩算法，则直接进入下一个处理器
-		if chosenEncoding == "" || chosenEncoding == encodingIdentity {
+		if chosenEncoding == "" || chosenEncoding == EncodingIdentity {
 			c.Next()
 			return
 		}
@@ -527,12 +527,12 @@ func Compression(opts CompressOptions) touka.HandlerFunc {
 func DefaultCompressionConfig() CompressOptions {
 	return CompressOptions{
 		Algorithms: map[string]AlgorithmConfig{
-			encodingGzip:    {Level: gzip.DefaultCompression, PoolEnabled: true},
-			encodingDeflate: {Level: flate.DefaultCompression, PoolEnabled: true},
+			EncodingGzip:    {Level: gzip.DefaultCompression, PoolEnabled: true},
+			EncodingDeflate: {Level: flate.DefaultCompression, PoolEnabled: true},
 		},
 		MinContentLength:  0,
-		CompressibleTypes: defaultCompressibleTypes,
-		EncodingPriority:  []string{encodingGzip, encodingDeflate},
+		CompressibleTypes: DefaultCompressibleTypes,
+		EncodingPriority:  []string{EncodingGzip, EncodingDeflate},
 	}
 }
 
@@ -600,7 +600,7 @@ func negotiateEncoding(clientPrefs []qValue, serverAlgos map[string]AlgorithmCon
 		// the server MAY compress the response with any content coding it deems appropriate."
 		// 然而，更安全的做法是，如果没有明确的 Accept-Encoding，则不压缩或仅压缩 gzip (如果服务器配置了)。
 		// 为了简单和明确，如果客户端没说，我们就不压缩。
-		return encodingIdentity // 或者 "" 表示不选择任何特定编码
+		return EncodingIdentity // 或者 "" 表示不选择任何特定编码
 	}
 
 	// 检查客户端是否明确接受 identity (不压缩)
@@ -609,7 +609,7 @@ func negotiateEncoding(clientPrefs []qValue, serverAlgos map[string]AlgorithmCon
 	acceptsAnything := false // 是否有 *
 
 	for _, pref := range clientPrefs {
-		if pref.value == encodingIdentity {
+		if pref.value == EncodingIdentity {
 			clientAcceptsIdentity = true
 			identityQValue = pref.q
 			// q=0 的 identity 表示不接受 identity，但我们已在 parseAcceptEncoding 中过滤了 q=0
@@ -666,7 +666,7 @@ func negotiateEncoding(clientPrefs []qValue, serverAlgos map[string]AlgorithmCon
 	// 如果遍历完所有服务器优先的算法，客户端都不接受，
 	// 或者客户端只接受 identity (q>0)，那么返回 identity
 	if clientAcceptsIdentity && identityQValue > 0 {
-		return encodingIdentity
+		return EncodingIdentity
 	}
 
 	return "" // 没有可接受的编码，或只接受 q=0 的编码 (不应发生)
