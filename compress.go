@@ -307,7 +307,7 @@ func releaseCompressResponseWriter(crw *compressResponseWriter) {
 		putCompressor(crw.compressor, crw.chosenEncoding, poolEnabled)
 		crw.compressor = nil
 	}
-	crw.ResponseWriter = nil
+	//crw.ResponseWriter = nil
 	crw.options = nil
 	compressResponseWriterPool.Put(crw)
 }
