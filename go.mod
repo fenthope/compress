@@ -4,7 +4,7 @@ go 1.25.1
 
 require (
 	github.com/infinite-iroha/touka v0.3.8
-	github.com/klauspost/compress v1.18.0
+	github.com/klauspost/compress v1.18.2
 )
 
 require (
