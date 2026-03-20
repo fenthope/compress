@@ -323,7 +323,7 @@ func (crw *compressResponseWriter) WriteHeader(statusCode int) {
 	crw.statusCode = statusCode
 
 	// 如果已决定不压缩 (例如，在 negotiateEncoding 中决定) 或者一些特定状态码，则直接写入
-	if !crw.doCompression || statusCode < http.StatusOK || statusCode == http.StatusNoContent || statusCode == http.StatusResetContent || statusCode == http.StatusNotModified {
+	if !crw.doCompression || statusCode < http.StatusOK || statusCode == http.StatusNoContent || statusCode == http.StatusResetContent || statusCode == http.StatusNotModified || statusCode == http.StatusPartialContent {
 		crw.ResponseWriter.WriteHeader(statusCode)
 		return
 	}
