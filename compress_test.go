@@ -2,13 +2,11 @@ package compress
 
 import (
 	"compress/gzip"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"net"
-	"bufio"
-	"fmt"
 	"testing"
 
 	"github.com/infinite-iroha/touka"
@@ -344,7 +342,6 @@ func TestCompressionNoContentLength(t *testing.T) {
 }
 
 func TestPoolsAndReset(t *testing.T) {
-    // Testing getCompressor and putCompressor with pools
     serverAlgos := map[string]AlgorithmConfig{
         EncodingGzip:    {Level: gzip.DefaultCompression, PoolEnabled: true},
         EncodingDeflate: {Level: flate.DefaultCompression, PoolEnabled: true},
@@ -379,8 +376,9 @@ func TestCompressionSpecialStatuses(t *testing.T) {
     for _, status := range statuses {
         path := fmt.Sprintf("/status%d", status)
         r.GET(path, func(c *touka.Context) {
-            c.Status(status)
-            c.String(status, "should not be compressed")
+            c.Writer.WriteHeader(status)
+            c.Header("Content-Type", "text/plain")
+            c.Writer.Write([]byte("should be compressed or not depends on status and content size"))
         })
 
         req := httptest.NewRequest("GET", path, nil)
@@ -388,9 +386,12 @@ func TestCompressionSpecialStatuses(t *testing.T) {
         w := httptest.NewRecorder()
         r.ServeHTTP(w, req)
 
-        if w.Header().Get("Content-Encoding") != "" && status != http.StatusPartialContent {
-             // Partial Content might be compressed in some implementations but here it's >= 200
-             // and not in the exclusion list [204, 205, 304]
+        encoding := w.Header().Get("Content-Encoding")
+        shouldCompress := false
+        isCompressed := encoding != ""
+
+        if shouldCompress != isCompressed {
+            t.Errorf("For status %d, compression expected: %v, but was: %v (encoding: %q)", status, shouldCompress, isCompressed, encoding)
         }
     }
 }
@@ -457,24 +458,12 @@ func TestCompressionNoPool(t *testing.T) {
 	}
 }
 
-type mockHijacker struct {
-	httptest.ResponseRecorder
-}
-
-func (m *mockHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return nil, nil, nil
-}
-
-// Touka context writer is an interface, but we need to pass a hijacker to the middleware
-// This is tricky because Touka might wrap it.
-
 func TestNegotiateEncodingNoMatch(t *testing.T) {
     serverAlgos := map[string]AlgorithmConfig{
         EncodingGzip: {Level: gzip.DefaultCompression, PoolEnabled: true},
     }
     serverPrio := []string{EncodingGzip}
 
-    // Client accepts something server doesn't support
     got := negotiateEncoding([]qValue{{"br", 1.0}}, serverAlgos, serverPrio)
     if got != "" {
         t.Errorf("Expected empty string, got %q", got)
@@ -482,15 +471,12 @@ func TestNegotiateEncodingNoMatch(t *testing.T) {
 }
 
 func TestParseAcceptEncodingEdge(t *testing.T) {
-    // Malformed q
     h := "gzip;q=invalid"
     got := parseAcceptEncoding(h)
     if len(got) != 0 {
-        // According to code, q becomes 0 and it's not added
         t.Errorf("Expected empty slice for invalid q, got %v", got)
     }
 
-    // q > 1
     h2 := "gzip;q=2.0"
     got2 := parseAcceptEncoding(h2)
     if got2[0].q != 1.0 {
@@ -535,14 +521,12 @@ func TestCompressionInvalidMinContentLengthHeader(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	// If ParseInt fails, it proceeds with compression
 	if w.Header().Get("Content-Encoding") != "gzip" {
 		t.Errorf("Expected gzip, got %q", w.Header().Get("Content-Encoding"))
 	}
 }
 
 func TestDeflatePool(t *testing.T) {
-    // Force usage of deflate pool
     w := getCompressor(EncodingDeflate, flate.BestSpeed, io.Discard, true)
     if w == nil {
         t.Fatal("Failed to get deflate compressor")
@@ -551,7 +535,7 @@ func TestDeflatePool(t *testing.T) {
     putCompressor(w, EncodingDeflate, true)
 
     w2 := getCompressor(EncodingDeflate, flate.BestSpeed, io.Discard, true)
-    if w2 != w {
-        // This is not guaranteed but highly likely with sync.Pool
+    if w2 == nil {
+        t.Fatal("Failed to get deflate compressor second time")
     }
 }
