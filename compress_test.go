@@ -369,30 +369,38 @@ func TestPoolsAndReset(t *testing.T) {
 }
 
 func TestCompressionSpecialStatuses(t *testing.T) {
-    r := touka.New()
-    r.Use(Compression(DefaultCompressionConfig()))
+    tests := []struct {
+        status         int
+        expectedEncode bool
+    }{
+        {http.StatusOK, true},
+        {http.StatusNoContent, false},
+        {http.StatusNotModified, false},
+        {http.StatusPartialContent, false}, // RFC 7231
+    }
 
-    statuses := []int{http.StatusNoContent, http.StatusNotModified, http.StatusPartialContent}
-    for _, status := range statuses {
-        path := fmt.Sprintf("/status%d", status)
-        r.GET(path, func(c *touka.Context) {
-            c.Writer.WriteHeader(status)
-            c.Header("Content-Type", "text/plain")
-            c.Writer.Write([]byte("should be compressed or not depends on status and content size"))
+    for _, tt := range tests {
+        t.Run(fmt.Sprintf("Status%d", tt.status), func(t *testing.T) {
+            r := touka.New()
+            r.Use(Compression(DefaultCompressionConfig()))
+            r.GET("/", func(c *touka.Context) {
+                c.Header("Content-Type", "text/plain")
+                c.Writer.WriteHeader(tt.status)
+                c.Writer.Write([]byte("this content is long enough for compression"))
+            })
+
+            req := httptest.NewRequest("GET", "/", nil)
+            req.Header.Set("Accept-Encoding", "gzip")
+            w := httptest.NewRecorder()
+            r.ServeHTTP(w, req)
+
+            encoding := w.Header().Get("Content-Encoding")
+            isCompressed := encoding != ""
+
+            if isCompressed != tt.expectedEncode {
+                t.Errorf("For status %d, expected compression: %v, got: %v (encoding: %q)", tt.status, tt.expectedEncode, isCompressed, encoding)
+            }
         })
-
-        req := httptest.NewRequest("GET", path, nil)
-        req.Header.Set("Accept-Encoding", "gzip")
-        w := httptest.NewRecorder()
-        r.ServeHTTP(w, req)
-
-        encoding := w.Header().Get("Content-Encoding")
-        shouldCompress := false
-        isCompressed := encoding != ""
-
-        if shouldCompress != isCompressed {
-            t.Errorf("For status %d, compression expected: %v, but was: %v (encoding: %q)", status, shouldCompress, isCompressed, encoding)
-        }
     }
 }
 
