@@ -38,11 +38,18 @@ const (
 // DefaultCompressibleTypes 默认可压缩的 MIME 类型列表
 var DefaultCompressibleTypes = []string{
 	"text/html", "text/css", "text/plain", "text/javascript",
-	"application/javascript", "application/x-javascript", "application/json",
-	"application/xml", "image/svg+xml",
+	"text/xml", "text/markdown", "text/yaml",
+	"application/javascript", "application/x-javascript",
+	"application/json", "application/xml",
+	"application/manifest+json", "application/ld+json", "application/vnd.api+json",
+	"application/atom+xml", "application/rss+xml",
+	"application/x-yaml", "application/rtf",
+	"application/wasm",
+	"image/svg+xml",
 	"application/font-woff", "application/font-woff2",
 	"application/x-font-woff", "application/x-font-woff2",
 	"application/vnd.ms-fontobject",
+	"font/ttf", "application/font-sfnt",
 	"image/x-icon",
 	"image/bmp",
 	"image/jpeg",
@@ -116,7 +123,7 @@ func initGzipPools() {
 		}
 
 		gzipWriterPoolsArray[idx] = &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				// 初始化时 writer 为 nil
 				w, _ := gzip.NewWriterLevel(nil, level)
 				return &gzipCompressWriter{Writer: w, level: level}
@@ -144,7 +151,7 @@ func initDeflatePools() {
 			idx = flate.BestCompression - flate.BestSpeed + 1
 		}
 		deflateWriterPoolsArray[idx] = &sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				w, _ := flate.NewWriter(nil, level)
 				return &deflateCompressWriter{Writer: w, level: level}
 			},
@@ -173,7 +180,7 @@ var zstdWriterPoolDefault *sync.Pool
 func initZstdPools() {
 	// 默认池化 zstd.SpeedDefault 级别
 	zstdWriterPoolDefault = &sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			// zstd.WithWindowSize(1<<20) // 1MB window, example option
 			w, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 			return &zstdCompressWriter{Encoder: w, level: zstd.SpeedDefault}
@@ -283,7 +290,7 @@ type compressResponseWriter struct {
 }
 
 var compressResponseWriterPool = sync.Pool{
-	New: func() interface{} { return &compressResponseWriter{} },
+	New: func() any { return &compressResponseWriter{} },
 }
 
 func acquireCompressResponseWriter(underlying touka.ResponseWriter, opts *CompressOptions) *compressResponseWriter {
@@ -549,8 +556,8 @@ func parseAcceptEncoding(header string) []qValue {
 	}
 
 	var qValues []qValue
-	parts := strings.Split(header, ",")
-	for _, part := range parts {
+	parts := strings.SplitSeq(header, ",")
+	for part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -563,8 +570,8 @@ func parseAcceptEncoding(header string) []qValue {
 		if len(params) > 1 {
 			for _, p := range params[1:] {
 				p = strings.TrimSpace(p)
-				if strings.HasPrefix(p, "q=") {
-					if qVal, err := strconv.ParseFloat(strings.TrimPrefix(p, "q="), 64); err == nil {
+				if after, ok := strings.CutPrefix(p, "q="); ok {
+					if qVal, err := strconv.ParseFloat(after, 64); err == nil {
 						if qVal >= 0 && qVal <= 1 { // q 值必须在 0 到 1 之间
 							q = qVal
 						} else if qVal > 1 {
