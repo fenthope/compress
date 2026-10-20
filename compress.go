@@ -101,6 +101,49 @@ type compressWriter interface {
 	Reset(w io.Writer) // 重置写入器以重用，并关联新的底层写入器
 }
 
+// --- 空闲编码器列表 ---
+//
+// 这里不用 sync.Pool：sync.Pool 的内容会在每次 GC 时被清空，压缩器随之被反复重建
+// （gzip 编码器约 470KB/次；实测 21k 请求里重建约 1400 次，占每请求分配量约 30KB，
+// 相当于总分配量的 24%）。带缓冲 channel 持有的空闲编码器可以跨 GC 存活。
+//
+// 每个级别一条列表，容量上限 defaultWriterPoolSize；只在该级别真的被用过时才占内存。
+type writerPool struct {
+	ch chan compressWriter
+}
+
+// defaultWriterPoolSize 每个压缩级别保留的空闲编码器数量。
+// 编码器常驻内存约 250KB（level 1）~1MB（level 9），按并发量取 4 即可。
+var defaultWriterPoolSize = 4
+
+func newWriterPool(size int) *writerPool {
+	if size <= 0 {
+		size = defaultWriterPoolSize
+	}
+	return &writerPool{ch: make(chan compressWriter, size)}
+}
+
+// get 取一个空闲编码器；没有则返回 nil（调用方新建）。
+func (p *writerPool) get() compressWriter {
+	select {
+	case w := <-p.ch:
+		return w
+	default:
+		return nil
+	}
+}
+
+// put 归还编码器；列表已满时直接丢弃，交给 GC。
+func (p *writerPool) put(w compressWriter) {
+	if w == nil {
+		return
+	}
+	select {
+	case p.ch <- w:
+	default:
+	}
+}
+
 // --- 压缩级别与对象池 ---
 //
 // 池槽位由 slotIndex/levelSlots 统一推导：init、get、put 三处必须使用同一套下标。
@@ -146,19 +189,12 @@ type gzipCompressWriter struct {
 func (gzw *gzipCompressWriter) Reset(w io.Writer) { gzw.Writer.Reset(w) }
 func (gzw *gzipCompressWriter) Flush() error      { return gzw.Writer.Flush() } // gzip.Writer.Flush() returns error
 
-var gzipWriterPools []*sync.Pool
+var gzipWriterPools []*writerPool
 
 func initGzipPools() {
-	gzipWriterPools = make([]*sync.Pool, len(gzipLevels))
-	for i, level := range gzipLevels {
-		level := level
-		gzipWriterPools[i] = &sync.Pool{
-			New: func() any {
-				// 初始化时 writer 为 nil
-				w, _ := gzip.NewWriterLevel(nil, level)
-				return &gzipCompressWriter{Writer: w, level: level}
-			},
-		}
+	gzipWriterPools = make([]*writerPool, len(gzipLevels))
+	for i := range gzipLevels {
+		gzipWriterPools[i] = newWriterPool(defaultWriterPoolSize)
 	}
 }
 
@@ -171,18 +207,12 @@ type deflateCompressWriter struct {
 func (fw *deflateCompressWriter) Reset(w io.Writer) { fw.Writer.Reset(w) }
 func (fw *deflateCompressWriter) Flush() error      { return fw.Writer.Flush() }
 
-var deflateWriterPools []*sync.Pool
+var deflateWriterPools []*writerPool
 
 func initDeflatePools() {
-	deflateWriterPools = make([]*sync.Pool, len(deflateLevels))
-	for i, level := range deflateLevels {
-		level := level
-		deflateWriterPools[i] = &sync.Pool{
-			New: func() any {
-				w, _ := flate.NewWriter(nil, level)
-				return &deflateCompressWriter{Writer: w, level: level}
-			},
-		}
+	deflateWriterPools = make([]*writerPool, len(deflateLevels))
+	for i := range deflateLevels {
+		deflateWriterPools[i] = newWriterPool(defaultWriterPoolSize)
 	}
 }
 
@@ -221,19 +251,12 @@ func (zw *zstdCompressWriter) Flush() error                      { return zw.Enc
 func (zw *zstdCompressWriter) Close() error                      { return zw.Encoder.Close() }
 func (zw *zstdCompressWriter) Write(p []byte) (n int, err error) { return zw.Encoder.Write(p) }
 
-var zstdWriterPools map[zstd.EncoderLevel]*sync.Pool
+var zstdWriterPools map[zstd.EncoderLevel]*writerPool
 
 func initZstdPools() {
-	zstdWriterPools = make(map[zstd.EncoderLevel]*sync.Pool, len(zstdLevels))
+	zstdWriterPools = make(map[zstd.EncoderLevel]*writerPool, len(zstdLevels))
 	for _, level := range zstdLevels {
-		level := level
-		zstdWriterPools[level] = &sync.Pool{
-			New: func() any {
-				// zstd.WithWindowSize(1<<20) // 1MB window, example option
-				w, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
-				return &zstdCompressWriter{Encoder: w, level: level}
-			},
-		}
+		zstdWriterPools[level] = newWriterPool(defaultWriterPoolSize)
 	}
 }
 
@@ -249,9 +272,10 @@ func getCompressor(encoding string, level int, underlyingWriter io.Writer, poolE
 	case EncodingGzip:
 		if poolEnabled {
 			if idx := slotIndex(gzipLevels, level); idx >= 0 && gzipWriterPools[idx] != nil {
-				cw := gzipWriterPools[idx].Get().(*gzipCompressWriter)
-				cw.Reset(underlyingWriter)
-				return cw
+				if cw, ok := gzipWriterPools[idx].get().(*gzipCompressWriter); ok && cw != nil {
+					cw.Reset(underlyingWriter)
+					return cw
+				}
 			}
 		}
 		// 如果池未启用或级别超出预设池范围，则创建新的
@@ -260,9 +284,10 @@ func getCompressor(encoding string, level int, underlyingWriter io.Writer, poolE
 	case EncodingDeflate:
 		if poolEnabled {
 			if idx := slotIndex(deflateLevels, level); idx >= 0 && deflateWriterPools[idx] != nil {
-				cw := deflateWriterPools[idx].Get().(*deflateCompressWriter)
-				cw.Reset(underlyingWriter)
-				return cw
+				if cw, ok := deflateWriterPools[idx].get().(*deflateCompressWriter); ok && cw != nil {
+					cw.Reset(underlyingWriter)
+					return cw
+				}
 			}
 		}
 		w, _ := flate.NewWriter(underlyingWriter, level)
@@ -271,9 +296,10 @@ func getCompressor(encoding string, level int, underlyingWriter io.Writer, poolE
 		zstdLevel := zstdLevelFromConfig(level)
 		if poolEnabled {
 			if p, ok := zstdWriterPools[zstdLevel]; ok {
-				cw := p.Get().(*zstdCompressWriter)
-				cw.Reset(underlyingWriter)
-				return cw
+				if cw, ok := p.get().(*zstdCompressWriter); ok && cw != nil {
+					cw.Reset(underlyingWriter)
+					return cw
+				}
 			}
 		}
 		w, _ := zstd.NewWriter(underlyingWriter, zstd.WithEncoderLevel(zstdLevel))
@@ -291,19 +317,19 @@ func putCompressor(cw compressWriter, encoding string, poolEnabled bool) {
 	case EncodingGzip:
 		if gzw, ok := cw.(*gzipCompressWriter); ok {
 			if idx := slotIndex(gzipLevels, gzw.level); idx >= 0 && gzipWriterPools[idx] != nil {
-				gzipWriterPools[idx].Put(gzw)
+				gzipWriterPools[idx].put(gzw)
 			}
 		}
 	case EncodingDeflate:
 		if fw, ok := cw.(*deflateCompressWriter); ok {
 			if idx := slotIndex(deflateLevels, fw.level); idx >= 0 && deflateWriterPools[idx] != nil {
-				deflateWriterPools[idx].Put(fw)
+				deflateWriterPools[idx].put(fw)
 			}
 		}
 	case EncodingZstd:
 		if zw, ok := cw.(*zstdCompressWriter); ok {
 			if p, ok := zstdWriterPools[zw.level]; ok {
-				p.Put(zw)
+				p.put(zw)
 			}
 		}
 	}

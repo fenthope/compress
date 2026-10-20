@@ -205,3 +205,51 @@ func TestNoEncoderAllocPerRequest(t *testing.T) {
 		t.Errorf("每请求分配 %.1f KB，超过 100KB 阈值：压缩器可能被重复创建", perReq/1024)
 	}
 }
+
+// 空闲编码器必须跨 GC 存活：sync.Pool 每次 GC 都会被清空，
+// 压缩器被反复重建（gzip 编码器约 470KB/次）。
+func TestPoolSurvivesGC(t *testing.T) {
+	w1 := getCompressor(EncodingGzip, gzip.DefaultCompression, io.Discard, true)
+	if w1 == nil {
+		t.Fatal("取不到 gzip 压缩器")
+	}
+	_, _ = w1.Write([]byte("hello"))
+	_ = w1.Close()
+	putCompressor(w1, EncodingGzip, true)
+
+	// 触发多次 GC，清空 sync.Pool 的 victim cache
+	for i := 0; i < 3; i++ {
+		runtime.GC()
+	}
+
+	w2 := getCompressor(EncodingGzip, gzip.DefaultCompression, io.Discard, true)
+	if w2 == nil {
+		t.Fatal("GC 之后取不到 gzip 压缩器")
+	}
+	if w1 != w2 {
+		t.Error("GC 之后编码器没有被复用：空闲列表没有跨 GC 存活")
+	}
+	_, _ = w2.Write([]byte("world"))
+	_ = w2.Close()
+	putCompressor(w2, EncodingGzip, true)
+}
+
+// 空闲列表必须有上限：超出容量的编码器直接丢弃，不能无限堆积。
+func TestPoolIsBounded(t *testing.T) {
+	idx := slotIndex(gzipLevels, gzip.BestSpeed)
+	pool := gzipWriterPools[idx]
+	cap := cap(pool.ch)
+	if cap <= 0 {
+		t.Fatalf("空闲列表容量异常：%d", cap)
+	}
+	for i := 0; i < cap+3; i++ {
+		w := getCompressor(EncodingGzip, gzip.BestSpeed, io.Discard, true)
+		if w == nil {
+			t.Fatal("取不到 gzip 压缩器")
+		}
+		putCompressor(w, EncodingGzip, true)
+	}
+	if got := len(pool.ch); got > cap {
+		t.Errorf("空闲列表长度 %d 超过上限 %d", got, cap)
+	}
+}
