@@ -101,6 +101,42 @@ type compressWriter interface {
 	Reset(w io.Writer) // 重置写入器以重用，并关联新的底层写入器
 }
 
+// --- 压缩级别与对象池 ---
+//
+// 池槽位由 slotIndex/levelSlots 统一推导：init、get、put 三处必须使用同一套下标。
+// 历史 bug：gzip/deflate 的槽位表只按 BestSpeed..BestCompression 初始化，
+// 而 get/put 又为 DefaultCompression/NoCompression 预留了额外槽位，导致这些级别
+// 命中一个 nil 池、压缩器被绕过 —— 每个响应都新建一个约 1MB 的 flate 编码器
+// （实测 1068KB/请求，池化后 6.5KB/请求）。
+//
+// 槽位顺序：HuffmanOnly(-2)、DefaultCompression(-1)、NoCompression(0)、BestSpeed..BestCompression。
+var (
+	gzipLevels    = levelSlots([]int{gzip.HuffmanOnly, gzip.DefaultCompression, gzip.NoCompression}, gzip.BestSpeed, gzip.BestCompression)
+	deflateLevels = levelSlots([]int{flate.HuffmanOnly, flate.DefaultCompression, flate.NoCompression}, flate.BestSpeed, flate.BestCompression)
+	// zstd 级别由 EncoderLevel 枚举，只有这四档做池化；其余级别直接新建编码器。
+	zstdLevels = []zstd.EncoderLevel{zstd.SpeedFastest, zstd.SpeedDefault, zstd.SpeedBetterCompression, zstd.SpeedBestCompression}
+)
+
+// levelSlots 生成「特殊级别 + BestSpeed..BestCompression」的有序槽位表。
+func levelSlots(specials []int, bestSpeed, bestCompression int) []int {
+	levels := make([]int, 0, len(specials)+bestCompression-bestSpeed+1)
+	levels = append(levels, specials...)
+	for l := bestSpeed; l <= bestCompression; l++ {
+		levels = append(levels, l)
+	}
+	return levels
+}
+
+// slotIndex 返回 level 在槽位表中的下标；不支持的级别返回 -1。
+func slotIndex(levels []int, level int) int {
+	for i, l := range levels {
+		if l == level {
+			return i
+		}
+	}
+	return -1
+}
+
 // --- gzip specific writer and pool ---
 type gzipCompressWriter struct {
 	*gzip.Writer
@@ -110,19 +146,13 @@ type gzipCompressWriter struct {
 func (gzw *gzipCompressWriter) Reset(w io.Writer) { gzw.Writer.Reset(w) }
 func (gzw *gzipCompressWriter) Flush() error      { return gzw.Writer.Flush() } // gzip.Writer.Flush() returns error
 
-var gzipWriterPoolsArray [gzip.BestCompression - gzip.BestSpeed + 3]*sync.Pool // +1 for DefaultCompression, +1 for 0 index
+var gzipWriterPools []*sync.Pool
 
 func initGzipPools() {
-	for i := gzip.BestSpeed; i <= gzip.BestCompression; i++ {
-		level := i
-		idx := level - gzip.BestSpeed // Map level to 0-based index for positive levels
-		if level == gzip.DefaultCompression {
-			idx = gzip.BestCompression - gzip.BestSpeed + 1 // Special index for DefaultCompression
-		} else if level == 0 { // gzip.NoCompression is 0
-			idx = gzip.BestCompression - gzip.BestSpeed + 2 // Special index for NoCompression
-		}
-
-		gzipWriterPoolsArray[idx] = &sync.Pool{
+	gzipWriterPools = make([]*sync.Pool, len(gzipLevels))
+	for i, level := range gzipLevels {
+		level := level
+		gzipWriterPools[i] = &sync.Pool{
 			New: func() any {
 				// 初始化时 writer 为 nil
 				w, _ := gzip.NewWriterLevel(nil, level)
@@ -141,16 +171,13 @@ type deflateCompressWriter struct {
 func (fw *deflateCompressWriter) Reset(w io.Writer) { fw.Writer.Reset(w) }
 func (fw *deflateCompressWriter) Flush() error      { return fw.Writer.Flush() }
 
-var deflateWriterPoolsArray [flate.BestCompression - flate.BestSpeed + 2]*sync.Pool // +1 for DefaultCompression
+var deflateWriterPools []*sync.Pool
 
 func initDeflatePools() {
-	for i := flate.BestSpeed; i <= flate.BestCompression; i++ {
-		level := i
-		idx := level - flate.BestSpeed
-		if level == flate.DefaultCompression {
-			idx = flate.BestCompression - flate.BestSpeed + 1
-		}
-		deflateWriterPoolsArray[idx] = &sync.Pool{
+	deflateWriterPools = make([]*sync.Pool, len(deflateLevels))
+	for i, level := range deflateLevels {
+		level := level
+		deflateWriterPools[i] = &sync.Pool{
 			New: func() any {
 				w, _ := flate.NewWriter(nil, level)
 				return &deflateCompressWriter{Writer: w, level: level}
@@ -159,10 +186,29 @@ func initDeflatePools() {
 	}
 }
 
+// zstdLevelFromConfig 把 CompressOptions 里的 int 级别解释成 zstd.EncoderLevel。
+// 配置语义与 README 一致：Level 取 int(zstd.SpeedXxx)，即枚举值 1..4。
+// 历史 bug：这里曾用 zstd.EncoderLevelFromZstd 转换（那是 zstd 原始级别 1..22 的刻度），
+// 导致 int(SpeedDefault)=2 被解释成 SpeedFastest、int(SpeedBestCompression)=4 被解释成
+// SpeedDefault —— 既不是用户配置的级别，池槽位也对不上。
+func zstdLevelFromConfig(level int) zstd.EncoderLevel {
+	switch level {
+	case int(zstd.SpeedFastest):
+		return zstd.SpeedFastest
+	case int(zstd.SpeedDefault):
+		return zstd.SpeedDefault
+	case int(zstd.SpeedBetterCompression):
+		return zstd.SpeedBetterCompression
+	case int(zstd.SpeedBestCompression):
+		return zstd.SpeedBestCompression
+	default:
+		// 兼容直接给 zstd 原始级别（1..22）的用法。
+		return zstd.EncoderLevelFromZstd(level)
+	}
+}
+
 // --- zstd specific writer and pool ---
-// zstd 级别较多，这里简化为只池化默认级别或用户指定的少数级别
-// 为了更通用，我们可以基于 AlgorithmConfig 中的 Level 动态创建池，或者只池化常见的。
-// 这里我们先为默认级别创建一个池。
+// zstd 级别较多，这里只池化 SpeedFastest/SpeedDefault/SpeedBetterCompression/SpeedBestCompression 四档。
 type zstdCompressWriter struct {
 	*zstd.Encoder
 	level zstd.EncoderLevel // zstd.EncoderLevel 是一个类型别名
@@ -175,16 +221,19 @@ func (zw *zstdCompressWriter) Flush() error                      { return zw.Enc
 func (zw *zstdCompressWriter) Close() error                      { return zw.Encoder.Close() }
 func (zw *zstdCompressWriter) Write(p []byte) (n int, err error) { return zw.Encoder.Write(p) }
 
-var zstdWriterPoolDefault *sync.Pool
+var zstdWriterPools map[zstd.EncoderLevel]*sync.Pool
 
 func initZstdPools() {
-	// 默认池化 zstd.SpeedDefault 级别
-	zstdWriterPoolDefault = &sync.Pool{
-		New: func() any {
-			// zstd.WithWindowSize(1<<20) // 1MB window, example option
-			w, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
-			return &zstdCompressWriter{Encoder: w, level: zstd.SpeedDefault}
-		},
+	zstdWriterPools = make(map[zstd.EncoderLevel]*sync.Pool, len(zstdLevels))
+	for _, level := range zstdLevels {
+		level := level
+		zstdWriterPools[level] = &sync.Pool{
+			New: func() any {
+				// zstd.WithWindowSize(1<<20) // 1MB window, example option
+				w, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
+				return &zstdCompressWriter{Encoder: w, level: level}
+			},
+		}
 	}
 }
 
@@ -198,41 +247,34 @@ func init() {
 func getCompressor(encoding string, level int, underlyingWriter io.Writer, poolEnabled bool) compressWriter {
 	switch encoding {
 	case EncodingGzip:
-		idx := level - gzip.BestSpeed
-		if level == gzip.DefaultCompression {
-			idx = gzip.BestCompression - gzip.BestSpeed + 1
-		}
-		if level == 0 {
-			idx = gzip.BestCompression - gzip.BestSpeed + 2
-		}
-		if poolEnabled && idx >= 0 && idx < len(gzipWriterPoolsArray) && gzipWriterPoolsArray[idx] != nil {
-			cw := gzipWriterPoolsArray[idx].Get().(*gzipCompressWriter)
-			cw.Reset(underlyingWriter)
-			return cw
+		if poolEnabled {
+			if idx := slotIndex(gzipLevels, level); idx >= 0 && gzipWriterPools[idx] != nil {
+				cw := gzipWriterPools[idx].Get().(*gzipCompressWriter)
+				cw.Reset(underlyingWriter)
+				return cw
+			}
 		}
 		// 如果池未启用或级别超出预设池范围，则创建新的
 		w, _ := gzip.NewWriterLevel(underlyingWriter, level)
 		return &gzipCompressWriter{Writer: w, level: level}
 	case EncodingDeflate:
-		idx := level - flate.BestSpeed
-		if level == flate.DefaultCompression {
-			idx = flate.BestCompression - flate.BestSpeed + 1
-		}
-		if poolEnabled && idx >= 0 && idx < len(deflateWriterPoolsArray) && deflateWriterPoolsArray[idx] != nil {
-			cw := deflateWriterPoolsArray[idx].Get().(*deflateCompressWriter)
-			cw.Reset(underlyingWriter)
-			return cw
+		if poolEnabled {
+			if idx := slotIndex(deflateLevels, level); idx >= 0 && deflateWriterPools[idx] != nil {
+				cw := deflateWriterPools[idx].Get().(*deflateCompressWriter)
+				cw.Reset(underlyingWriter)
+				return cw
+			}
 		}
 		w, _ := flate.NewWriter(underlyingWriter, level)
 		return &deflateCompressWriter{Writer: w, level: level}
 	case EncodingZstd:
-		// 简化：仅当级别为 SpeedDefault 且池启用时才使用池
-		// 生产代码中可以为特定需要的 zstd 级别创建更多池
-		zstdLevel := zstd.EncoderLevelFromZstd(level) // 将 int 转换为 zstd.EncoderLevel
-		if poolEnabled && zstdLevel == zstd.SpeedDefault && zstdWriterPoolDefault != nil {
-			cw := zstdWriterPoolDefault.Get().(*zstdCompressWriter)
-			cw.Reset(underlyingWriter)
-			return cw
+		zstdLevel := zstdLevelFromConfig(level)
+		if poolEnabled {
+			if p, ok := zstdWriterPools[zstdLevel]; ok {
+				cw := p.Get().(*zstdCompressWriter)
+				cw.Reset(underlyingWriter)
+				return cw
+			}
 		}
 		w, _ := zstd.NewWriter(underlyingWriter, zstd.WithEncoderLevel(zstdLevel))
 		return &zstdCompressWriter{Encoder: w, level: zstdLevel}
@@ -248,31 +290,20 @@ func putCompressor(cw compressWriter, encoding string, poolEnabled bool) {
 	switch encoding {
 	case EncodingGzip:
 		if gzw, ok := cw.(*gzipCompressWriter); ok {
-			idx := gzw.level - gzip.BestSpeed
-			if gzw.level == gzip.DefaultCompression {
-				idx = gzip.BestCompression - gzip.BestSpeed + 1
-			}
-			if gzw.level == 0 {
-				idx = gzip.BestCompression - gzip.BestSpeed + 2
-			}
-			if idx >= 0 && idx < len(gzipWriterPoolsArray) && gzipWriterPoolsArray[idx] != nil {
-				gzipWriterPoolsArray[idx].Put(gzw)
+			if idx := slotIndex(gzipLevels, gzw.level); idx >= 0 && gzipWriterPools[idx] != nil {
+				gzipWriterPools[idx].Put(gzw)
 			}
 		}
 	case EncodingDeflate:
 		if fw, ok := cw.(*deflateCompressWriter); ok {
-			idx := fw.level - flate.BestSpeed
-			if fw.level == flate.DefaultCompression {
-				idx = flate.BestCompression - flate.BestSpeed + 1
-			}
-			if idx >= 0 && idx < len(deflateWriterPoolsArray) && deflateWriterPoolsArray[idx] != nil {
-				deflateWriterPoolsArray[idx].Put(fw)
+			if idx := slotIndex(deflateLevels, fw.level); idx >= 0 && deflateWriterPools[idx] != nil {
+				deflateWriterPools[idx].Put(fw)
 			}
 		}
 	case EncodingZstd:
 		if zw, ok := cw.(*zstdCompressWriter); ok {
-			if zw.level == zstd.SpeedDefault && zstdWriterPoolDefault != nil { // 仅返还默认级别的到池
-				zstdWriterPoolDefault.Put(zw)
+			if p, ok := zstdWriterPools[zw.level]; ok {
+				p.Put(zw)
 			}
 		}
 	}

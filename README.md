@@ -51,3 +51,12 @@ func main() {
 	}))
 }
 ```
+
+## 压缩级别与对象池
+
+- `Algorithms[enc].Level` 的取值：
+  - gzip / deflate：标准库压缩级别（`HuffmanOnly(-2)`、`DefaultCompression(-1)`、`NoCompression(0)`、`BestSpeed(1)`..`BestCompression(9)`）。
+  - zstd：`int(zstd.SpeedFastest|SpeedDefault|SpeedBetterCompression|SpeedBestCompression)`（枚举值 1..4）。
+- `PoolEnabled: true` 时，压缩器会按级别从对象池取用并归还，避免每个响应都新建编码器
+  （gzip 默认级别约 1MB/编码器，不池化时每请求多约 1MB 分配）。
+- 池槽位覆盖上述全部级别；zstd 只对四个标准档位池化，其余级别直接新建编码器。
